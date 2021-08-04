@@ -3,13 +3,16 @@ package testcase
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"math/big"
 	"os"
 	"os/exec"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +21,8 @@ import (
 	coretypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
+	"github.com/smartbch/moeingads"
+	"github.com/smartbch/moeingads/store/rabbit"
 
 	"github.com/smartbch/moeingevm/types"
 	"github.com/smartbch/moeingevm/utils"
@@ -28,25 +33,25 @@ import (
 */
 import "C"
 
-type evmc_address = C.struct_evmc_address
-type evmc_bytes32 = C.struct_evmc_bytes32
-type added_log = C.struct_added_log
+//type evmc_address = C.struct_evmc_address
+//type evmc_bytes32 = C.struct_evmc_bytes32
+//type added_log = C.struct_added_log
 
-func toArr20(addr *evmc_address) [20]byte {
-	var arr [20]byte
-	for i := range arr {
-		arr[i] = byte(addr.bytes[i])
-	}
-	return arr
-}
+//func toArr20(addr *evmc_address) [20]byte {
+//	var arr [20]byte
+//	for i := range arr {
+//		arr[i] = byte(addr.bytes[i])
+//	}
+//	return arr
+//}
 
-func toArr32(addr *evmc_bytes32) [32]byte {
-	var arr [32]byte
-	for i := 0; i < 32; i++ {
-		arr[i] = byte(addr.bytes[i])
-	}
-	return arr
-}
+//func toArr32(addr *evmc_bytes32) [32]byte {
+//	var arr [32]byte
+//	for i := 0; i < 32; i++ {
+//		arr[i] = byte(addr.bytes[i])
+//	}
+//	return arr
+//}
 
 func isAllZero(bz []byte) bool {
 	for _, b := range bz {
@@ -121,6 +126,80 @@ func NewWorldState() WorldState {
 	}
 }
 
+func GetWorldStateFromMads(mads *moeingads.MoeingADS) *WorldState {
+	world := NewWorldState()
+	mads.ScanAll(func(key, value []byte) {
+		if bytes.Equal(key, types.StandbyTxQueueKey[:]) {
+			return
+		}
+		if len(key) != 8 {
+			panic(fmt.Sprintf("Strange Key %v", key))
+		}
+		if 64 <= key[0] && key[0] < 64+128 { // in the range for rabbit
+			cv := rabbit.BytesToCachedValue(value)
+			UpdateWorldState(&world, cv.GetKey(), cv.GetValue())
+		}
+	})
+	return &world
+}
+
+func CompareWorldState(stateA, stateB *WorldState) (bool, error) {
+	if !reflect.DeepEqual(stateA.Accounts, stateB.Accounts) {
+		return false, errors.New("accounts not equal")
+	}
+	if !reflect.DeepEqual(stateA.Bytecodes, stateB.Bytecodes) {
+		return false, errors.New("bytecode not equal")
+	}
+	if !reflect.DeepEqual(stateA.Values, stateB.Values) {
+		return false, errors.New("value not equal")
+	}
+	if stateA.BlockHashes != stateB.BlockHashes {
+		return false, errors.New("block hash not equal")
+	}
+	if stateA.CreationCounters != stateB.CreationCounters {
+		return false, errors.New("creation counters not equal")
+	}
+	return true, nil
+}
+
+func UpdateWorldState(world *WorldState, key, value []byte) {
+	if key[0] == types.CREATION_COUNTER_KEY {
+		world.CreationCounters[int(key[0])] = binary.BigEndian.Uint64(value)
+	} else if key[0] == types.ACCOUNT_KEY {
+		var addr [20]byte
+		copy(addr[:], key[1:])
+		accInfo := types.NewAccountInfo(value)
+		world.Accounts[addr] = &BasicAccount{
+			Sequence: accInfo.Sequence(),
+			Nonce:    accInfo.Nonce(),
+		}
+		world.Accounts[addr].Balance.SetBytes32(accInfo.BalanceSlice())
+	} else if key[0] == types.BYTECODE_KEY {
+		var addr [20]byte
+		copy(addr[:], key[1:])
+		bi := BytecodeInfo{Bytecode: value[33:]}
+		copy(bi.Codehash[:], value[1:33]) // value[0] is version byte
+		world.Bytecodes[addr] = bi
+	} else if key[0] == types.VALUE_KEY {
+		skey := StorageKey{AccountSeq: binary.BigEndian.Uint64(key[1:9])}
+		copy(skey.Key[:], key[9:])
+		world.Values[skey] = append([]byte{}, value...)
+	} else if bytes.Equal([]byte{types.CURR_BLOCK_KEY}, key) {
+		//Is OK
+	} else {
+		fmt.Printf("Why key %v value %v\n", key, value)
+		panic("Unknown Key")
+	}
+}
+
+func (world WorldState) SumAllBalance() *uint256.Int {
+	res := uint256.NewInt()
+	for _, acc := range world.Accounts {
+		res.Add(res, &acc.Balance)
+	}
+	return res
+}
+
 func (world WorldState) Clone() (out WorldState) {
 	out.CreationCounters = world.CreationCounters
 	out.BlockHashes = world.BlockHashes
@@ -168,6 +247,10 @@ type DumbSigner struct {
 }
 
 var _ coretypes.Signer = (*DumbSigner)(nil)
+
+func (signer *DumbSigner) ChainID() *big.Int {
+	return big.NewInt(1)
+}
 
 // Sender returns the sender address of the transaction.
 func (signer *DumbSigner) Sender(tx *coretypes.Transaction) (addr common.Address, err error) {
@@ -430,6 +513,12 @@ func toHex(bz []byte) string {
 	return hex.EncodeToString(bz)
 }
 
+var (
+	// record pending gas fee and refund
+	systemContractAddress = [20]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		byte('s'), byte('y'), byte('s'), byte('t'), byte('e'), byte('m')}
+)
+
 func PrintWorldState(fout io.Writer, state *WorldState) {
 	addrList := make([][20]byte, 0, len(state.Accounts))
 	for addr := range state.Accounts {
@@ -439,6 +528,9 @@ func PrintWorldState(fout io.Writer, state *WorldState) {
 		return bytes.Compare(addrList[i][:], addrList[j][:]) < 0
 	})
 	for _, addr := range addrList {
+		if addr == systemContractAddress {
+			continue
+		}
 		acc := state.Accounts[addr]
 		fmt.Fprintf(fout, " addr 0x%s\n", toHex(addr[:]))
 		fmt.Fprintf(fout, "  acc_nonce %d\n", acc.Nonce)

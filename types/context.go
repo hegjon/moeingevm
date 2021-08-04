@@ -2,16 +2,12 @@ package types
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
-	"fmt"
+	"math"
 
 	"github.com/holiman/uint256"
-	"github.com/tendermint/tendermint/crypto/ed25519"
 
 	"github.com/ethereum/go-ethereum/common"
-	gethrpc "github.com/ethereum/go-ethereum/rpc"
-
 	"github.com/smartbch/moeingads/store/rabbit"
 	modbtypes "github.com/smartbch/moeingdb/types"
 )
@@ -20,6 +16,7 @@ var (
 	ErrAccountNotExist = errors.New("account does not exist")
 	ErrNonceTooSmall   = errors.New("tx nonce is smaller than the account nonce")
 	ErrNonceTooLarge   = errors.New("tx nonce is larger than the account nonce")
+	ErrTooManyEntries  = errors.New("too many candidicate entries to be returned, please limit the difference between startHeight and endHeight")
 )
 
 type Context struct {
@@ -86,11 +83,6 @@ func (c *Context) SetAccount(address common.Address, acc *AccountInfo) {
 	c.Rbt.Set(k, acc.Bytes())
 }
 
-func (c *Context) DeleteAccount(address common.Address) {
-	k := GetAccountKey(address)
-	c.Rbt.Delete(k)
-}
-
 func (c *Context) GetCode(contract common.Address) *BytecodeInfo {
 	k := GetBytecodeKey(contract)
 	v := c.Rbt.Get(k)
@@ -98,11 +90,6 @@ func (c *Context) GetCode(contract common.Address) *BytecodeInfo {
 		return NewBytecodeInfo(v)
 	}
 	return nil
-}
-
-func (c *Context) SetCode(contract common.Address, code *BytecodeInfo) {
-	k := GetBytecodeKey(contract)
-	c.Rbt.Set(k, code.Bytes())
 }
 
 func (c *Context) GetStorageAt(seq uint64, key string) []byte {
@@ -127,26 +114,6 @@ func (c *Context) GetCurrBlockBasicInfo() *Block {
 
 func (c *Context) SetCurrBlockBasicInfo(blk *Block) {
 	c.Rbt.Set([]byte{CURR_BLOCK_KEY}, blk.SerializeBasicInfo())
-}
-
-func (c *Context) GetCurrValidators() []ed25519.PubKey {
-	bz := c.Rbt.Get([]byte{CURR_VALIDATORS_KEY})
-	var vals []ed25519.PubKey
-	if bz != nil {
-		err := json.Unmarshal(bz, &vals)
-		if err != nil {
-			panic(err)
-		}
-	}
-	return vals
-}
-
-func (c *Context) SetCurrValidators(vals []ed25519.PubKey) {
-	b, err := json.Marshal(vals)
-	if err != nil {
-		panic(err)
-	}
-	c.Rbt.Set([]byte{CURR_VALIDATORS_KEY}, b)
 }
 
 func (c *Context) StoreBlock(blk *modbtypes.Block) {
@@ -183,6 +150,10 @@ func (c *Context) GetTxByHash(txHash common.Hash) (tx *Transaction, err error) {
 	return
 }
 
+func (c *Context) GetBlockHashByHeight(height uint64) [32]byte {
+	return c.Db.GetBlockHashByHeight(int64(height))
+}
+
 func (c *Context) GetBlockByHeight(height uint64) (*Block, error) {
 	bz := c.Db.GetBlockByHeight(int64(height))
 	if len(bz) == 0 {
@@ -213,11 +184,7 @@ func (c *Context) GetBlockByHash(hash common.Hash) (blk *Block, err error) {
 	return
 }
 
-func (c *Context) GetBalance(owner common.Address, height int64) (*uint256.Int, error) {
-	if height != int64(gethrpc.LatestBlockNumber) {
-		return nil, fmt.Errorf("TODO: GetBalance(), h=%d", height)
-	}
-
+func (c *Context) GetBalance(owner common.Address) (*uint256.Int, error) {
 	if acc := c.GetAccount(owner); acc != nil {
 		return acc.Balance(), nil
 	}
@@ -230,7 +197,6 @@ func (c *Context) CheckNonce(sender common.Address, nonce uint64) (*AccountInfo,
 		return nil, ErrAccountNotExist
 	}
 	n := acc.Nonce()
-	//fmt.Printf("acc:%s, acc nonce:%d, tx nonce:%d\n", sender, n, nonce)
 	if nonce < n {
 		return acc, ErrNonceTooSmall
 	} else if nonce > n {
@@ -239,21 +205,16 @@ func (c *Context) CheckNonce(sender common.Address, nonce uint64) (*AccountInfo,
 	return acc, nil
 }
 
-func (c *Context) IncrNonce(sender common.Address, acc *AccountInfo) {
-	acc.UpdateNonce(acc.Nonce() + 1)
-	c.SetAccount(sender, acc)
-}
-
 func (c *Context) DeductTxFee(sender common.Address, acc *AccountInfo, txGas uint64, gasPrice *uint256.Int) error {
 	acc.UpdateNonce(acc.Nonce() + 1)
 	var gasFee, gas uint256.Int
 	gas.SetUint64(txGas)
 	gasFee.Mul(&gas, gasPrice)
 	x := acc.Balance()
-	x.Sub(x, &gasFee)
-	if x.Cmp(acc.Balance()) == 1 {
+	if x.Cmp(&gasFee) < 0 {
 		return errors.New("account balance is not enough for fee")
 	}
+	x.Sub(x, &gasFee)
 	acc.UpdateBalance(x)
 	c.SetAccount(sender, acc)
 	return nil
@@ -268,23 +229,66 @@ func isInTopicSlice(topic [32]byte, topics [][32]byte) bool {
 	return false
 }
 
-func (c *Context) BasicQueryLogs(address common.Address, topics []common.Hash, startHeight, endHeight uint32) (logs []Log, err error) {
+func (c *Context) BasicQueryLogs(address common.Address, topics []common.Hash,
+	startHeight, endHeight, limit uint32) (logs []Log, err error) {
+
 	var rawAddress [20]byte = address
 	rawTopics := FromGethHashes(topics)
-	c.Db.BasicQueryLogs(&rawAddress, rawTopics, startHeight, endHeight, func(data []byte) bool {
+	c.Db.BasicQueryLogs(&rawAddress, rawTopics, startHeight, endHeight, func(data []byte) (needMore bool) {
+		if data == nil {
+			err = ErrTooManyEntries
+			return false
+		}
 		tx := Transaction{}
 		if _, err = tx.UnmarshalMsg(data); err != nil {
 			return false
 		}
 		for _, log := range tx.Logs {
-			hasAll := true
+			hasAll := rawAddress == log.Address
 			for _, t := range topics {
-				if !isInTopicSlice(t, log.Topics) {
-					hasAll = false
+				if !hasAll {
 					break
 				}
+				hasAll = hasAll && isInTopicSlice(t, log.Topics)
 			}
 			if hasAll {
+				logs = append(logs, log)
+				if limit > 0 && len(logs) >= int(limit) {
+					return false
+				}
+			}
+		}
+		return true
+	})
+
+	return
+}
+
+type FilterFunc func(addr common.Address, topics []common.Hash, addrList []common.Address, topicsList [][]common.Hash) (ok bool)
+
+func (c *Context) QueryLogs(addresses []common.Address, topics [][]common.Hash, startHeight, endHeight uint32, filter FilterFunc) (logs []Log, err error) {
+	rawAddresses := FromGethAddreses(addresses)
+	rawTopics := make([][][32]byte, len(topics))
+	for i, t := range topics {
+		rawTopics[i] = FromGethHashes(t)
+	}
+
+	c.Db.QueryLogs(rawAddresses, rawTopics, startHeight, endHeight, func(data []byte) bool {
+		if data == nil {
+			err = ErrTooManyEntries
+			return false
+		}
+		tx := Transaction{}
+		if _, err = tx.UnmarshalMsg(data); err != nil {
+			return false
+		}
+
+		var topicArr [4]common.Hash
+		for _, log := range tx.Logs {
+			for i, topic := range log.Topics {
+				topicArr[i] = common.Hash(topic)
+			}
+			if filter(common.Address(log.Address), topicArr[:len(log.Topics)], addresses, topics) {
 				logs = append(logs, log)
 			}
 		}
@@ -294,62 +298,63 @@ func (c *Context) BasicQueryLogs(address common.Address, topics []common.Hash, s
 	return
 }
 
-func (c *Context) QueryLogs(addresses []common.Address, topics [][]common.Hash, startHeight, endHeight uint32) (logs []Log, err error) {
-	rawAddresses := FromGethAddreses(addresses)
-	rawTopics := make([][][32]byte, len(topics))
-	for i, t := range topics {
-		rawTopics[i] = FromGethHashes(t)
-	}
-
-	c.Db.QueryLogs(rawAddresses, rawTopics, startHeight, endHeight, func(data []byte) bool {
-		tx := Transaction{}
-		if _, err = tx.UnmarshalMsg(data); err != nil {
-			return false
-		}
-
-		logs = append(logs, tx.Logs...)
-		return true
-	})
-
-	return
-}
-
-func (c *Context) QueryTxBySrc(addr common.Address, startHeight, endHeight uint32) (txs []*Transaction, err error) {
+func (c *Context) QueryTxBySrc(addr common.Address, startHeight, endHeight, limit uint32) (txs []*Transaction, err error) {
 	c.Db.QueryTxBySrc(addr, startHeight, endHeight, func(data []byte) bool {
+		if data == nil {
+			err = ErrTooManyEntries
+			return false
+		}
 		tx := Transaction{}
 		if _, err = tx.UnmarshalMsg(data); err != nil {
 			return false
 		}
-		if bytes.Equal(tx.From[:], addr[:]) { // for hash-conflicts corner case
+		if bytes.Equal(tx.From[:], addr[:]) { // compare them to prevent hash-conflict corner case
 			txs = append(txs, &tx)
+		}
+		if limit > 0 && len(txs) >= int(limit) {
+			return false
 		}
 		return true
 	})
 	return
 }
 
-func (c *Context) QueryTxByDst(addr common.Address, startHeight, endHeight uint32) (txs []*Transaction, err error) {
+func (c *Context) QueryTxByDst(addr common.Address, startHeight, endHeight, limit uint32) (txs []*Transaction, err error) {
 	c.Db.QueryTxByDst(addr, startHeight, endHeight, func(data []byte) bool {
+		if data == nil {
+			err = ErrTooManyEntries
+			return false
+		}
 		tx := Transaction{}
 		if _, err = tx.UnmarshalMsg(data); err != nil {
 			return false
 		}
-		if bytes.Equal(tx.To[:], addr[:]) { // for hash-conflicts corner case
+		if bytes.Equal(tx.To[:], addr[:]) { // compare them to prevent hash-conflict corner case
 			txs = append(txs, &tx)
+		}
+		if limit > 0 && len(txs) >= int(limit) {
+			return false
 		}
 		return true
 	})
 	return
 }
 
-func (c *Context) QueryTxByAddr(addr common.Address, startHeight, endHeight uint32) (txs []*Transaction, err error) {
+func (c *Context) QueryTxByAddr(addr common.Address, startHeight, endHeight, limit uint32) (txs []*Transaction, err error) {
 	c.Db.QueryTxBySrcOrDst(addr, startHeight, endHeight, func(data []byte) bool {
+		if data == nil {
+			err = ErrTooManyEntries
+			return false
+		}
 		tx := Transaction{}
 		if _, err = tx.UnmarshalMsg(data); err != nil {
 			return false
 		}
-		if bytes.Equal(tx.From[:], addr[:]) || bytes.Equal(tx.To[:], addr[:]) { // for hash-conflicts corner case
+		if bytes.Equal(tx.From[:], addr[:]) || bytes.Equal(tx.To[:], addr[:]) {
 			txs = append(txs, &tx)
+		}
+		if limit > 0 && len(txs) >= int(limit) {
+			return false
 		}
 		return true
 	})
@@ -357,7 +362,11 @@ func (c *Context) QueryTxByAddr(addr common.Address, startHeight, endHeight uint
 }
 
 func (c *Context) GetTxListByHeight(height uint32) (txs []*Transaction, err error) {
-	txContents := c.Db.GetTxListByHeight(int64(height))
+	return c.GetTxListByHeightWithRange(height, 0, math.MaxInt32)
+}
+
+func (c *Context) GetTxListByHeightWithRange(height uint32, start, end int) (txs []*Transaction, err error) {
+	txContents := c.Db.GetTxListByHeightWithRange(int64(height), start, end)
 	txs = make([]*Transaction, len(txContents))
 	for i, txContent := range txContents {
 		txs[i] = &Transaction{}
@@ -367,4 +376,34 @@ func (c *Context) GetTxListByHeight(height uint32) (txs []*Transaction, err erro
 		}
 	}
 	return txs, err
+}
+
+// return the times addr acts as the to-address of a transaction
+func (c *Context) GetToAddressCount(addr common.Address) int64 {
+	k := append([]byte{modbtypes.TO_ADDR_KEY}, addr[:]...)
+	return c.Db.QueryNotificationCounter(k)
+}
+
+// return the times addr acts as the from-address of a transaction
+func (c *Context) GetFromAddressCount(addr common.Address) int64 {
+	k := append([]byte{modbtypes.FROM_ADDR_KEY}, addr[:]...)
+	return c.Db.QueryNotificationCounter(k)
+}
+
+// return the times addr acts as the to-address of a SEP20 Transfer event at some contract
+func (c *Context) GetSep20ToAddressCount(contract common.Address, addr common.Address) int64 {
+	var zero12 [12]byte
+	k := append([]byte{modbtypes.TRANS_TO_ADDR_KEY}, contract[:]...)
+	k = append(k, zero12[:]...)
+	k = append(k, addr[:]...)
+	return c.Db.QueryNotificationCounter(k)
+}
+
+// return the times addr acts as a from-address of a SEP20 Transfer event at some contract
+func (c *Context) GetSep20FromAddressCount(contract common.Address, addr common.Address) int64 {
+	var zero12 [12]byte
+	k := append([]byte{modbtypes.TRANS_FROM_ADDR_KEY}, contract[:]...)
+	k = append(k, zero12[:]...)
+	k = append(k, addr[:]...)
+	return c.Db.QueryNotificationCounter(k)
 }

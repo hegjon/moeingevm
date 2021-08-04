@@ -1,7 +1,6 @@
 package ebptests
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -29,9 +28,9 @@ func WriteWorldStateToRabbit(rbt rabbit.RabbitStore, world *tc.WorldState) {
 	}
 	for addr, bi := range world.Bytecodes {
 		k := types.GetBytecodeKey(addr)
-		bz := make([]byte, 32+len(bi.Bytecode))
-		copy(bz[:32], bi.Codehash[:])
-		copy(bz[32:], bi.Bytecode)
+		bz := make([]byte, 33+len(bi.Bytecode))
+		copy(bz[1:33], bi.Codehash[:])
+		copy(bz[33:], bi.Bytecode)
 		rbt.Set(k, bz)
 	}
 	for addr, acc := range world.Accounts {
@@ -48,38 +47,6 @@ func WriteWorldStateToRabbit(rbt rabbit.RabbitStore, world *tc.WorldState) {
 	}
 }
 
-func UpdateWorldState(world *tc.WorldState, key, value []byte) {
-	if key[0] == types.CREATION_COUNTER_KEY {
-		world.CreationCounters[int(key[0])] = binary.BigEndian.Uint64(value)
-	} else if key[0] == types.ACCOUNT_KEY {
-		var addr [20]byte
-		copy(addr[:], key[1:])
-		accInfo := types.NewAccountInfo(value)
-		world.Accounts[addr] = &tc.BasicAccount{
-			Sequence: accInfo.Sequence(),
-			Nonce:    accInfo.Nonce(),
-		}
-		world.Accounts[addr].Balance.SetBytes32(accInfo.BalanceSlice())
-	} else if key[0] == types.BYTECODE_KEY {
-		var addr [20]byte
-		copy(addr[:], key[1:])
-		bi := tc.BytecodeInfo{Bytecode: append([]byte{}, value[32:]...)}
-		copy(bi.Codehash[:], key[:32])
-		world.Bytecodes[addr] = bi
-	} else if key[0] == types.VALUE_KEY {
-		skey := tc.StorageKey{AccountSeq: binary.BigEndian.Uint64(key[1:9])}
-		copy(skey.Key[:], key[9:])
-		world.Values[skey] = append([]byte{}, value...)
-	} else if bytes.Equal(types.StandbyTxQueueKey, key) {
-		//Is OK
-	} else if bytes.Equal([]byte{types.CURR_BLOCK_KEY}, key) {
-		//Is OK
-	} else {
-		fmt.Printf("Why key %v value %v\n", key, value)
-		panic("Unknown Key")
-	}
-}
-
 var (
 	GuardStart      = []byte{0, 0, 0, 0, 0, 0, 0, 0}
 	GuardStartPlus1 = []byte{0, 0, 0, 0, 0, 0, 0, 1}
@@ -89,8 +56,10 @@ var (
 var IgnoreFiles []string
 
 func runTestCase(filename string, theCase *tc.TestCase, printLog bool) {
+	ebp.AdjustGasUsed = false // to be compatible with EVM test vectors
+
 	for _, f := range IgnoreFiles {
-		if strings.Index(filename, f) != -1 {
+		if strings.Contains(filename, f) {
 			fmt.Printf("Ignore File: %s\n", filename)
 			return
 		}
@@ -115,7 +84,7 @@ func runTestCase(filename string, theCase *tc.TestCase, printLog bool) {
 	defer root.Close()
 	height := int64(1)
 	root.SetHeight(height)
-	trunk := root.GetTrunkStore().(*store.TrunkStore)
+	trunk := root.GetTrunkStore(1000).(*store.TrunkStore)
 	rbt := rabbit.NewRabbitStore(trunk)
 	WriteWorldStateToRabbit(rbt, world)
 	rbt.Close()
@@ -124,7 +93,7 @@ func runTestCase(filename string, theCase *tc.TestCase, printLog bool) {
 
 	// execute currTx
 	currTx := currBlock.TxList[0].ToEthTx()
-	trunk = root.GetTrunkStore().(*store.TrunkStore)
+	trunk = root.GetTrunkStore(1000).(*store.TrunkStore)
 	var chainId big.Int
 	chainId.SetBytes(currBlock.ChainId[:])
 	txEngine := ebp.NewEbpTxExec(10, 100, 32, 100, &tc.DumbSigner{})
@@ -133,29 +102,18 @@ func runTestCase(filename string, theCase *tc.TestCase, printLog bool) {
 	ctx = ctx.WithRbt(&rbt)
 	txEngine.SetContext(ctx)
 	txEngine.CollectTx(currTx)
-	txEngine.Prepare()
+	txEngine.Prepare(0, 0, ebp.DefaultTxGasLimit)
+	txList := txEngine.CommittedTxs()
+	fmt.Printf("after Prepare txList len %d\n", len(txList))
 	txEngine.Execute(&currBlock.BlockInfo)
 	trunk.Close(true)
-	txList := txEngine.CommittedTxs()
+	txList = txEngine.CommittedTxs()
 	var gasFee uint256.Int
 	gasFee.Mul(uint256.NewInt().SetUint64(txList[0].GasUsed),
 		utils.U256FromSlice32(txList[0].GasPrice[:]))
 
-	// create new tc.WorldState according to MoeingADS
-	newWorld := tc.NewWorldState()
-	world = &newWorld
-	iter := mads.Iterator(GuardStartPlus1, GuardEnd)
-	defer iter.Close()
-	for iter.Valid() {
-		key := iter.Key()
-		value := iter.Value()
-		if len(key) != 8 {
-			panic(fmt.Sprintf("Strange Key %v", key))
-		}
-		cv := rabbit.BytesToCachedValue(value)
-		UpdateWorldState(world, cv.GetKey(), cv.GetValue())
-		iter.Next()
-	}
+	// create new tc.WorldState according to MoeingADS's content
+	world = tc.GetWorldStateFromMads(mads)
 
 	blockReward.SetUint64(2000000000000000000)
 	blockReward.Add(blockReward, &gasFee)
@@ -211,5 +169,5 @@ func StandaloneMain() {
 	} else {
 		fmt.Printf("NOT RUN \n")
 	}
-	return
+	//return
 }
